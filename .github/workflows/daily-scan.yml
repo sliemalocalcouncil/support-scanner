@@ -1,0 +1,102 @@
+name: Daily Scan
+
+on:
+  # 23:00 UTC Mon-Fri = ~2-3 hours after US market close (safe for both EDT/EST).
+  # This covers Mon/Tue/Wed/Thu/Fri closes. Adjust if your needs differ.
+  schedule:
+    - cron: "0 23 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      skip_fetch:
+        description: "Skip Polygon fetch and re-run analysis on existing cache only"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ─── Step 1: Universe Scan (builds watchlist) ────────────────────────
+      - name: Universe Scan
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          POLYGON_RATE_LIMIT_PER_MIN: ${{ vars.POLYGON_RATE_LIMIT_PER_MIN || '5' }}
+          MAX_FETCH_PER_RUN: ${{ vars.MAX_FETCH_PER_RUN || '400' }}
+        run: |
+          if [ "${{ github.event.inputs.skip_fetch }}" = "true" ]; then
+            python -m src.scan_universe --skip-fetch
+          else
+            python -m src.scan_universe
+          fi
+
+      # ─── Step 2: Signal Scan (runs after watchlist is populated) ─────────
+      - name: Signal Scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_NOTIFY_ON_EMPTY: ${{ vars.TELEGRAM_NOTIFY_ON_EMPTY || '0' }}
+          TELEGRAM_MAX_SIGNALS: ${{ vars.TELEGRAM_MAX_SIGNALS || '30' }}
+        run: python -m src.scan_signals
+
+      # ─── Artifacts: CSV files downloadable from the run page ─────────────
+      - name: Upload result CSVs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_id }}
+          path: out/
+          retention-days: 90
+
+      # ─── Commit state back to the repo so next run is incremental ────────
+      - name: Commit updated state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data/ state/ out/
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "chore(scan): daily update $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          fi
+
+      # ─── On failure: ping Telegram so you know the scanner is broken ─────
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets not set — skipping failure notification."
+            exit 0
+          fi
+          MSG=$'⚠️ <b>S&amp;P 500 Scanner failed</b>\nDate: '"$(date -u +%Y-%m-%d)"$'\nRun: '"$RUN_URL"
+          curl -sS --fail -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=HTML" \
+            -d "disable_web_page_preview=true" \
+            --data-urlencode "text=${MSG}" \
+            > /dev/null || echo "Telegram failure-notify failed (non-fatal)."
