@@ -1,9 +1,9 @@
 {
   "scan_type": "universe",
-  "finished_at": "2026-05-05T23:43:31Z",
+  "finished_at": "2026-05-06T23:44:28Z",
   "ticker_count": 99,
-  "primary_count": 27,
+  "primary_count": 31,
   "monitor_count": 26,
   "failed_count": 0,
-  "cache_rows": 19127
+  "cache_rows": 19211
 }
